@@ -1,0 +1,221 @@
+# l3rain-waker (public runner) — TEMPORARY BRIDGE.
+#
+# WHY THIS EXISTS
+#   The private repo cpdadev-llc/l3rain exhausted its 2,000 free private-Actions
+#   minutes, so `.github/workflows/waker-hosted.yml` can no longer run there until the
+#   monthly pool resets. Public-repo Actions minutes are UNLIMITED and free (they are NOT
+#   billed against the org's private-minute pool), so this PUBLIC repo runs the waker on
+#   the org's behalf while the private one is capped.
+#
+# WHAT IT DOES
+#   Faithfully mirrors waker-hosted.yml, except the l3rain repo is NOT the workspace here.
+#   Instead it is CLONED at runtime over HTTPS with a fine-grained PAT (secrets.L3RAIN_PAT),
+#   the identical orchestrator/Claude-Code invocation runs inside that clone, and breadcrumbs
+#   are committed + pushed back to cpdadev-llc/l3rain with the same PAT.
+#
+# SECURITY POSTURE (public repo — treat every log line as world-readable)
+#   - NO l3rain source, docs, or secrets live in THIS repo. l3rain is cloned into ./l3rain
+#     at runtime and is git-ignored so it can never be committed here.
+#   - NEVER add a `pull_request` trigger: a fork PR could exfiltrate the secrets. Only
+#     workflow_dispatch + schedule (both run trusted, first-party code only).
+#   - Secrets (L3RAIN_PAT, CLAUDE_CODE_OAUTH_TOKEN) are auto-masked by Actions and are never
+#     echoed; the PAT is embedded in the clone/push remote URL, which bash does not print.
+#   - permissions: contents: read — this workflow needs no write access to THIS repo.
+#
+# RETIREMENT
+#   This is a stopgap. Once the private minutes reset AND the Cloudflare-triggering fix lands,
+#   waker-hosted.yml resumes as the primary waker and this workflow can be disabled or the
+#   whole repo deleted. Do not build anything else on top of it.
+name: l3rain-waker (public runner)
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly floor; public minutes are free, so frequency isn't cost-limited
+  workflow_dispatch:
+    inputs:
+      force_mode:
+        description: "Override guard mode: resume | refill (blank = auto-detect)."
+        required: false
+        default: ""
+  # NEVER add pull_request — secret-exfiltration risk on a public repo.
+
+concurrency:
+  group: l3rain-waker-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SENTINEL_NEAR_WINDOW: "1800"   # sec: if reset is within this, sleep+burst in-job
+      SENTINEL_BURST_MAX: "10"       # burst retries, 1 per minute, stop on first success
+    steps:
+      - name: Preflight — required secrets present?
+        id: pre
+        env:
+          HAS_PAT: ${{ secrets.L3RAIN_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::error::L3RAIN_PAT secret is not set on this repo — cannot clone the private cpdadev-llc/l3rain. Set it in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "L3RAIN_PAT present — proceeding to clone."
+
+      - name: Clone private l3rain (PAT, runtime only — never committed to this repo)
+        env:
+          L3RAIN_PAT: ${{ secrets.L3RAIN_PAT }}
+        run: |
+          # Token is embedded in the remote URL for auth; Actions masks it in all logs and
+          # bash does not echo the expanded command. The ./l3rain dir is git-ignored here.
+          git clone --depth 1 "https://x-access-token:${L3RAIN_PAT}@github.com/cpdadev-llc/l3rain.git" l3rain
+          echo "cloned l3rain @ $(git -C l3rain rev-parse --short HEAD) on $(git -C l3rain rev-parse --abbrev-ref HEAD)"
+
+      - name: Guards (pure shell, 0 tokens)
+        id: guard
+        working-directory: l3rain
+        env:
+          FORCE_MODE: ${{ github.event.inputs.force_mode }}
+          HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN not set — nothing to run."
+            # Honest dashboard signal: the status-lights writer reads progress.log, so
+            # record the no-token state (once — deduped) instead of leaving a stale/false
+            # light. The Persist step is skipped for notoken, so commit+push it here.
+            if ! tail -n 1 progress.log 2>/dev/null | grep -q "no token — fleet cannot run"; then
+              git config user.name "l3rain-agent[bot]" || true
+              git config user.email "l3rain-agent@users.noreply.github.com" || true
+              echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }}: no token — fleet cannot run" >> progress.log
+              git add progress.log 2>/dev/null || true
+              git commit -q -m "agent: waker(runner) no-token breadcrumb [skip ci]" 2>/dev/null || true
+              git push -q 2>/dev/null || true
+            fi
+            echo "mode=notoken" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -f STOP ]; then
+            echo "STOP present — halted."
+            echo "mode=stop" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -n "$FORCE_MODE" ]; then
+            echo "mode=$FORCE_MODE" >> "$GITHUB_OUTPUT"
+          elif [ -f .l3rain/resume-queue.json ] && jq -e '[.queue[] | select(.status=="pending")] | length > 0' .l3rain/resume-queue.json >/dev/null 2>&1; then
+            echo "mode=resume" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=refill" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Enable pnpm + install Claude Code
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        run: |
+          corepack enable
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Run orchestrator (usage-sentinel burst on near reset)
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        working-directory: l3rain
+        env:
+          # gh CLICK and any git push target the PRIVATE l3rain repo, so use the PAT here,
+          # not this runner repo's github.token (which has no access to l3rain).
+          GH_TOKEN: ${{ secrets.L3RAIN_PAT }}
+          WAKER_MODE: ${{ steps.guard.outputs.mode }}
+          RUN_ID: ${{ github.run_id }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set +e
+          RESUME_PROMPT='You are agent-cpd-orchestrator. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md, .l3rain/resume-queue.json, and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Relaunch each pending workstream where it stopped, in dependency order, per operating rule 3. Atomic tasks; at ~95% usage CHECKPOINT per rule 3 (commit + push + queue update) and stop cleanly. Staleness rule: if the queue contradicts git reality, trust git log + l3rain_operational_progress.md and repair the queue. Mark entries done as their work lands; mark blocked-needs-joseph and SKIP after a failed 3-round escalation.'
+          REFILL_PROMPT='You are agent-cpd-orchestrator. The resume queue is empty. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md (section "Next"), and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Maximum-autonomy build mode: pull the next task(s) from l3rain_operational_progress.md "Next" in priority order (when dry, derive from the CLAUDE.md phase gates), decompose into atomic workstreams per rule 3, enqueue them in .l3rain/resume-queue.json (commit + push), then execute the first one. Same checkpoint, staleness, and blocked-needs-joseph rules. NEVER perform tier-3 irreversible actions (first prod deploy, real money, external comms, real tenants, legal/fiscal) — those need explicit instruction.'
+          if [ "$WAKER_MODE" = "refill" ]; then PROMPT="$REFILL_PROMPT"; else PROMPT="$RESUME_PROMPT"; fi
+
+          LIMIT_RE='usage limit|session limit|rate limit|weekly limit|hit your [a-z ]*limit|too many requests|429|resets? (at|in) |try again (at|in) |quota'
+          run_claude () { claude -p "$PROMPT" --dangerously-skip-permissions --model claude-opus-4-8 > waker-run.log 2>&1; }
+
+          # Joseph's computed reset chain: the first run_claude below OPENS this 5h window,
+          # so its reset = now + 5h. Record it to progress.log NOW (the Persist step pushes
+          # it → the sentinel re-arms for reset+60s) — no cap hit needed, no-op if another
+          # session already opened this window. scripts/window-reset-tracker.mjs.
+          node scripts/window-reset-tracker.mjs || true
+
+          run_claude; EXIT=$?
+          echo "claude exit: $EXIT"; tail -n 12 waker-run.log
+          if [ "$EXIT" -eq 0 ]; then echo "success"; exit 0; fi
+
+          if ! grep -qiE "$LIMIT_RE" waker-run.log; then
+            echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: exit $EXIT NON-LIMIT — see artifact" >> progress.log
+            exit 0
+          fi
+
+          # --- usage-sentinel: it IS a usage limit ---
+          mkdir -p .l3rain
+          TARGET=$(bash scripts/waker-target-epoch.sh waker-run.log 2>/dev/null || true)
+          NOW=$(date -u +%s)
+          if [ -n "$TARGET" ]; then
+            WHEN=$(date -u -d "@$TARGET" +%FT%TZ 2>/dev/null || echo "$TARGET")
+            WAIT=$(( TARGET - NOW ))
+          else
+            WHEN="UNPARSEABLE"; WAIT=-1
+          fi
+          echo "$(date -u +%FT%TZ) run=$RUN_ID mode=$WAKER_MODE limit_hit reset_at=$WHEN wait_s=$WAIT" >> .l3rain/reset-observations.log
+          echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: usage limit; reset_at=$WHEN wait_s=$WAIT" >> progress.log
+
+          NEAR=${SENTINEL_NEAR_WINDOW:-1800}
+          BURST=${SENTINEL_BURST_MAX:-10}
+          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -le "$NEAR" ]; then
+            echo "near reset (${WAIT}s) — sleeping then bursting up to ${BURST}x @1/min"
+            sleep "$WAIT"
+            for i in $(seq 1 "$BURST"); do
+              run_claude; EXIT=$?
+              echo "burst $i/$BURST exit=$EXIT"
+              [ "$EXIT" -eq 0 ] && { echo "resumed on burst $i"; echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: resumed on burst $i" >> progress.log; break; }
+              grep -qiE "$LIMIT_RE" waker-run.log || { echo "burst non-limit error"; break; }
+              sleep 60
+            done
+          else
+            echo "far/unknown reset (${WAIT}s) — exiting; the hourly cron is the fallback floor for this bridge"
+          fi
+          exit 0
+
+      - name: Update usage-reset ledger (auto-append)
+        if: always() && steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        working-directory: l3rain
+        run: node scripts/usage-reset-ledger.mjs || true
+
+      - name: Persist breadcrumbs and work products (push back to l3rain via PAT)
+        if: always() && steps.guard.outputs.mode != 'notoken'
+        working-directory: l3rain
+        run: |
+          git config user.name "l3rain-agent[bot]"
+          git config user.email "l3rain-agent@users.noreply.github.com"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }} branch=$BRANCH mode=${{ steps.guard.outputs.mode || 'unknown' }} status=${{ job.status }}" >> progress.log
+          git add -A
+          if git diff --cached --quiet; then echo "nothing to persist"; exit 0; fi
+          if git diff --cached --name-only | grep -qE '^(apps|packages)/'; then
+            MSG="agent: waker(runner) run ${{ github.run_id }} work products"
+          else
+            MSG="agent: waker(runner) run ${{ github.run_id }} breadcrumbs [skip ci]"
+          fi
+          git commit -m "$MSG"
+          # origin already carries the PAT from the clone URL, so push authenticates cleanly.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git pull --rebase origin "$BRANCH" || true
+          fi
+          git push -u origin "HEAD:$BRANCH" || (git pull --rebase origin "$BRANCH" && git push -u origin "HEAD:$BRANCH")
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: waker-runner-run-${{ github.run_id }}
+          path: l3rain/waker-run.log
+          retention-days: 7
+          if-no-files-found: ignore

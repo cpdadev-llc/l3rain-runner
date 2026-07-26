@@ -1,0 +1,9 @@
+# The private l3rain repo is cloned here at runtime — it must NEVER be committed to this
+# public runner repo. Keeping the ignore rule here is a second line of defense on top of the
+# workflow only ever pushing back to l3rain (never committing into this repo's checkout).
+/l3rain/
+l3rain/
+
+# Runtime logs / artifacts
+*.log
+waker-run.log
