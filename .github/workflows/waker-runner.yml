@@ -1,17 +1,35 @@
-# l3rain-waker (public runner) — TEMPORARY BRIDGE.
+# l3rain-waker (public runner) — TEMPORARY BRIDGE, and currently the ONLY working waker lane.
 #
 # WHY THIS EXISTS
 #   The private repo cpdadev-llc/l3rain exhausted its 2,000 free private-Actions
 #   minutes, so `.github/workflows/waker-hosted.yml` can no longer run there until the
-#   monthly pool resets. Public-repo Actions minutes are UNLIMITED and free (they are NOT
-#   billed against the org's private-minute pool), so this PUBLIC repo runs the waker on
-#   the org's behalf while the private one is capped.
+#   monthly pool resets — every Cloudflare-sentinel dispatch at it dies at the billing gate
+#   in ~4s. Public-repo Actions minutes are UNLIMITED and free (they are NOT billed against
+#   the org's private-minute pool), so this PUBLIC repo runs the waker on the org's behalf.
 #
-# WHAT IT DOES
-#   Faithfully mirrors waker-hosted.yml, except the l3rain repo is NOT the workspace here.
-#   Instead it is CLONED at runtime over HTTPS with a fine-grained PAT (secrets.L3RAIN_PAT),
-#   the identical orchestrator/Claude-Code invocation runs inside that clone, and breadcrumbs
-#   are committed + pushed back to cpdadev-llc/l3rain with the same PAT.
+# WHY IT SLEEPS (the reset-precision fix — 2026-07-27)
+#   The fleet must resume ~60s after the 5-hour usage window rolls. That precision used to come
+#   from the Cloudflare sentinel dispatching at exactly reset+60s; it can no longer reach a lane
+#   that runs. GitHub also THROTTLES this repo's hourly cron to ~1-4h gaps (observed 00:17Z →
+#   04:54Z → 08:48Z → 12:37Z), so "wait for the next tick" means waking up to 4h late.
+#   Because public minutes are free, the job can instead BUY the precision with wall-clock:
+#   it stays alive and `sleep`s to the real reset, then starts Claude immediately. Two paths:
+#     (1) PRE-FLIGHT GATE — reads the REAL reset from the usage sentinel before spending a
+#         Claude call, and sleeps only when the sentinel's fresh live reading proves the
+#         window is already maxed (>= WINDOW_FULL_PCT).
+#     (2) IN-JOB DETECTOR — if the orchestrator hits the cap mid-run, the reset is parsed out
+#         of Claude's OWN refusal text (the most authoritative source there is) and the job
+#         sleeps to it, then burst-retries. This path used to be capped at a 30-minute
+#         "near reset" window; it is now the full sleep horizon, because minutes are free.
+#   Net effect: whatever tick we land on, the fleet resumes at reset+~60s, not up to 4h late.
+#
+# WHY WE DO NOT PRE-EMPTIVELY SLEEP ON THE BREADCRUMB ALONE
+#   `breadcrumbReset` records when the CURRENT window opened (open + 5h). A breadcrumb reset in
+#   the future does NOT mean we are capped — the window may still have plenty of headroom, and
+#   sleeping on it would idle a perfectly usable window. Only a FRESH `live` reading carries
+#   usedPct, so only a fresh live reading can justify pre-emptive sleep. Without one we RUN and
+#   let path (2) supply the precision. `breadcrumbReset` is still used as the fallback *value*
+#   for the reset instant when live says "capped" but `live.fiveHourReset` is missing/garbled.
 #
 # SECURITY POSTURE (public repo — treat every log line as world-readable)
 #   - NO l3rain source, docs, or secrets live in THIS repo. l3rain is cloned into ./l3rain
@@ -21,24 +39,48 @@
 #   - Secrets (L3RAIN_PAT, CLAUDE_CODE_OAUTH_TOKEN) are auto-masked by Actions and are never
 #     echoed; the PAT is embedded in the clone/push remote URL, which bash does not print.
 #   - permissions: contents: read — this workflow needs no write access to THIS repo.
+#   - The sentinel URL is public read-only JSON (no auth, no secrets in the request).
 #
-# RETIREMENT
-#   This is a stopgap. Once the private minutes reset AND the Cloudflare-triggering fix lands,
-#   waker-hosted.yml resumes as the primary waker and this workflow can be disabled or the
-#   whole repo deleted. Do not build anything else on top of it.
+# RETIREMENT / DECOMMISSION TRIGGER
+#   Retire the sleep mechanism (and this whole repo) when BOTH hold:
+#     a) the private repo's Actions minutes are available again (pool reset or paid plan), AND
+#     b) the Cloudflare sentinel can dispatch a lane that actually runs — i.e. its PAT is
+#        re-scoped to reach a live workflow (owner-only change).
+#   Then waker-hosted.yml resumes as the primary waker, dispatched at reset+60s by the sentinel,
+#   and this workflow can be disabled or the repo deleted. Do not build anything else on it.
 name: l3rain-waker (public runner)
 
 on:
   schedule:
-    - cron: "17 * * * *"   # hourly floor; public minutes are free, so frequency isn't cost-limited
+    # Hourly FLOOR only. GitHub throttles public-repo cron to ~1-4h gaps; that is fine now,
+    # because whichever tick we land on, the job sleeps forward to the exact reset.
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       force_mode:
         description: "Override guard mode: resume | refill (blank = auto-detect)."
         required: false
         default: ""
+      gate_dry_run:
+        description: "true = evaluate + log the usage gate, then stop (no sleep, no Claude). Free way to test the decision logic."
+        required: false
+        default: ""
+      sleep_horizon_s:
+        description: "Override the max pre-flight sleep in seconds (default 14400 = 4h). 0 disables pre-flight sleeping."
+        required: false
+        default: ""
   # NEVER add pull_request — secret-exfiltration risk on a public repo.
 
+# OVERLAP GUARD. A job may now stay alive for hours while it sleeps to the reset, so the next
+# cron tick would otherwise start a SECOND orchestrator against the same resume queue (two
+# agents editing/pushing the same branch = conflicting commits and duplicated work).
+#   group: a single fixed group ⇒ at most ONE run of this workflow executes at any instant.
+#   cancel-in-progress: false ⇒ a new tick must NEVER kill a sleeper that is 3h into waiting for
+#     the reset (that is precisely the run we care about). New ticks queue instead; GitHub keeps
+#     only the newest pending run per group, so the backlog can never exceed 1 and the fleet
+#     picks straight back up when the sleeper finishes.
+# A second, independent guard lives in the post-sleep re-check step below: it aborts if ANOTHER
+# lane (hosted waker, sentinel dispatch, Joseph's interactive session) woke while we slept.
 concurrency:
   group: l3rain-waker-runner
   cancel-in-progress: false
@@ -49,10 +91,24 @@ permissions:
 jobs:
   wake:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # GitHub's hard cap for a hosted job is 6h/360min. 330 keeps 30min of margin so that a
+    # long sleep + a full orchestrator run can never be guillotined mid-write. All sleeps are
+    # additionally clamped against JOB_DEADLINE_EPOCH computed from this budget.
+    timeout-minutes: 330
     env:
-      SENTINEL_NEAR_WINDOW: "1800"   # sec: if reset is within this, sleep+burst in-job
-      SENTINEL_BURST_MAX: "10"       # burst retries, 1 per minute, stop on first success
+      SENTINEL_URL: "https://l3rain-usage-sentinel.cpda-wdev.workers.dev/"
+      # Max wall-clock we are willing to sleep INSIDE a job, either path. 4h is chosen because:
+      # the window is 5h, so a worst-case wait is < 5h; 5h of sleep + an orchestrator run does
+      # not fit the 6h job cap, whereas 4h + 60min reserve does (240+60=300 < 330 < 360).
+      # A reset further out than 4h means the window only just opened — a later tick (the cron
+      # floor fires every ~1-4h) will land inside the horizon and take the wait.
+      SLEEP_HORIZON_S: "14400"
+      JOB_BUDGET_S: "19800" # 330 min, must match timeout-minutes
+      PREFLIGHT_RESERVE_S: "3600" # keep >= 1h for the orchestrator after a pre-flight sleep
+      BURST_RESERVE_S: "2700" # keep >= 45min for the burst retries after an in-job sleep
+      WINDOW_FULL_PCT: "95" # same threshold the Cloudflare sentinel uses
+      LIVE_FRESH_S: "1200" # same 20-min freshness the sentinel uses for its live reading
+      SENTINEL_BURST_MAX: "10" # burst retries after the in-job sleep, 1/min, stop on success
     steps:
       - name: Preflight — required secrets present?
         id: pre
@@ -108,30 +164,172 @@ jobs:
             echo "mode=refill" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up Node
+      # ── THE USAGE GATE ────────────────────────────────────────────────────────────────
+      # Reads the REAL 5h reset from the Cloudflare sentinel (never computes one) and decides:
+      #   run   → window has headroom (or we cannot prove otherwise) ⇒ start Claude now
+      #   sleep → fresh live reading says the window is MAXED ⇒ sleep to reset+60s, then start
+      #   exit  → weekly cap, or the reset is beyond the sleep horizon ⇒ leave it to a later tick
+      # It must NEVER hang on a bad reading: every unknown resolves to "run".
+      - name: Usage gate — read the REAL 5h reset from the sentinel
+        id: gate
         if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        env:
+          HORIZON_OVERRIDE: ${{ github.event.inputs.sleep_horizon_s }}
+          GATE_DRY_RUN: ${{ github.event.inputs.gate_dry_run }}
+        run: |
+          set -u
+          NOW=$(date -u +%s)
+          DEADLINE=$(( NOW + JOB_BUDGET_S ))
+          echo "JOB_DEADLINE_EPOCH=$DEADLINE" >> "$GITHUB_ENV"
+
+          HORIZON="$SLEEP_HORIZON_S"
+          case "${HORIZON_OVERRIDE:-}" in ''|*[!0-9]*) : ;; *) HORIZON="$HORIZON_OVERRIDE"; echo "horizon overridden to ${HORIZON}s";; esac
+
+          iso2epoch () { [ -n "${1:-}" ] && date -u -d "$1" +%s 2>/dev/null || true; }
+          emit () { # emit <gate> <sleep_s> <reason> [target_iso]
+            echo "gate=$1"      >> "$GITHUB_OUTPUT"
+            echo "sleep_s=$2"   >> "$GITHUB_OUTPUT"
+            echo "reason=$3"    >> "$GITHUB_OUTPUT"
+            echo "target=${4:-}" >> "$GITHUB_OUTPUT"
+            echo "::notice title=usage gate::$1 (sleep=${2}s) — $3 ${4:+[reset $4]}"
+            echo "DECISION: gate=$1 sleep=${2}s reason=$3 target=${4:-none}"
+          }
+
+          # --- read the sentinel (never fatal) ---
+          if ! curl -fsS --max-time 20 --retry 2 --retry-delay 3 "$SENTINEL_URL" -o sentinel.json 2>/dev/null; then
+            emit run 0 "sentinel-unreachable — proceeding immediately (never hang on a bad reading)"; exit 0
+          fi
+          echo "sentinel says:"; jq -c '{now,breadcrumbReset,lastWakerActivity,live}' sentinel.json 2>/dev/null || cat sentinel.json
+          if ! jq -e . sentinel.json >/dev/null 2>&1; then
+            emit run 0 "sentinel-unparseable — proceeding immediately"; exit 0
+          fi
+
+          LIVE_RESET=$(jq -r '.live.fiveHourReset // empty' sentinel.json)
+          LIVE_PCT=$(jq -r '.live.fiveHourUsedPct // empty' sentinel.json)
+          WEEK_PCT=$(jq -r '.live.weeklyUsedPct // empty' sentinel.json)
+          CAPTURED=$(jq -r '.live.capturedAt // empty' sentinel.json)
+          BREAD=$(jq -r '.breadcrumbReset // empty' sentinel.json)
+          LWA=$(jq -r '.lastWakerActivity // empty' sentinel.json)
+          echo "last waker activity anywhere: ${LWA:-none}"
+          # Recorded so the post-sleep overlap guard can tell "someone else woke while we slept".
+          echo "GATE_START_EPOCH=$NOW" >> "$GITHUB_ENV"
+
+          # --- is the live reading fresh enough to be authoritative? ---
+          CAP_E=$(iso2epoch "$CAPTURED"); LIVE_OK=0
+          if [ -n "${CAP_E:-}" ] && [ -n "$LIVE_PCT" ]; then
+            AGE=$(( NOW - CAP_E ))
+            if [ "$AGE" -le "$LIVE_FRESH_S" ] && [ "$AGE" -ge -300 ]; then LIVE_OK=1; fi
+            echo "live capture age=${AGE}s (fresh<=${LIVE_FRESH_S}s) → live_ok=$LIVE_OK"
+          else
+            echo "no usable live reading in sentinel payload"
+          fi
+
+          if [ "$LIVE_OK" != "1" ]; then
+            # No fresh usedPct ⇒ no proof we are capped. A future breadcrumbReset only says when
+            # the window OPENED, so sleeping on it would idle a window that may be 20% used.
+            # Run, and let the in-job detector (Claude's own reset text) supply the precision.
+            emit run 0 "no-fresh-live-reading (breadcrumbReset=${BREAD:-none}) — run now; in-job detector will sleep to the real reset if we are actually capped"; exit 0
+          fi
+
+          FIVE=${LIVE_PCT%%.*}; WEEK=${WEEK_PCT%%.*}
+          case "$FIVE" in ''|*[!0-9]*) FIVE=0;; esac
+          case "$WEEK" in ''|*[!0-9]*) WEEK=0;; esac
+
+          if [ "$WEEK" -ge "$WINDOW_FULL_PCT" ]; then
+            # A 5h reset does not clear a WEEKLY cap — sleeping to it would burn hours for a run
+            # that still cannot work. Leave it to a later tick.
+            emit exit 0 "weekly cap at ${WEEK}% (>=${WINDOW_FULL_PCT}%) — a 5h reset will not clear it"; exit 0
+          fi
+
+          if [ "$FIVE" -lt "$WINDOW_FULL_PCT" ]; then
+            emit run 0 "live-window-open: 5h at ${FIVE}% (<${WINDOW_FULL_PCT}%) — headroom, run now" "$LIVE_RESET"; exit 0
+          fi
+
+          # --- capped: pick the reset instant (live preferred, breadcrumb as fallback) ---
+          TARGET_ISO="$LIVE_RESET"; TARGET=$(iso2epoch "$LIVE_RESET"); SRC=live
+          if [ -z "${TARGET:-}" ]; then TARGET_ISO="$BREAD"; TARGET=$(iso2epoch "$BREAD"); SRC=breadcrumb; fi
+          if [ -z "${TARGET:-}" ]; then
+            emit run 0 "5h at ${FIVE}% but NO parseable reset (live+breadcrumb both garbled) — proceeding immediately"; exit 0
+          fi
+
+          WAKE=$(( TARGET + 60 ))   # reset + 60s, exactly like the sentinel's dispatch offset
+          WAIT=$(( WAKE - NOW ))
+          if [ "$WAIT" -le 0 ]; then
+            emit run 0 "window already reopened (${SRC} reset ${TARGET_ISO} is ${WAIT#-}s in the past) — run now" "$TARGET_ISO"; exit 0
+          fi
+
+          MAXS=$(( DEADLINE - NOW - PREFLIGHT_RESERVE_S ))
+          [ "$MAXS" -gt "$HORIZON" ] && MAXS="$HORIZON"
+          if [ "$WAIT" -gt "$MAXS" ]; then
+            emit exit 0 "5h maxed (${FIVE}%) but ${SRC} reset ${TARGET_ISO} is ${WAIT}s out (> horizon ${MAXS}s) — a later cron tick will take the wait"; exit 0
+          fi
+          emit sleep "$WAIT" "5h maxed (${FIVE}%) — sleeping ${WAIT}s to ${SRC} reset+60s" "$TARGET_ISO"
+
+      - name: Gate dry-run — stop here
+        if: github.event.inputs.gate_dry_run == 'true'
+        run: |
+          echo "gate_dry_run=true → decision was '${{ steps.gate.outputs.gate }}' (sleep ${{ steps.gate.outputs.sleep_s }}s): ${{ steps.gate.outputs.reason }}"
+          echo "Stopping before any sleep / Claude invocation."
+
+      # Toolchain is installed BEFORE the sleep so that when the window rolls we start Claude
+      # within seconds of reset+60s instead of spending ~40s on npm first.
+      - name: Set up Node
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken' && steps.gate.outputs.gate != 'exit' && github.event.inputs.gate_dry_run != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Enable pnpm + install Claude Code
-        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken' && steps.gate.outputs.gate != 'exit' && github.event.inputs.gate_dry_run != 'true'
         run: |
           corepack enable
           npm install -g @anthropic-ai/claude-code
 
-      - name: Run orchestrator (usage-sentinel burst on near reset)
-        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+      # THE SLEEP. Free on a public repo; this is what buys reset+60s precision despite the
+      # cron being throttled to ~1-4h. Clamped by the horizon AND the job deadline upstream.
+      - name: Sleep to reset+60s
+        id: sleeper
+        if: steps.gate.outputs.gate == 'sleep' && github.event.inputs.gate_dry_run != 'true'
+        run: |
+          set -u
+          S="${{ steps.gate.outputs.sleep_s }}"
+          echo "sleeping ${S}s → target ${{ steps.gate.outputs.target }} +60s (now $(date -u +%FT%TZ))"
+          sleep "$S"
+          echo "woke at $(date -u +%FT%TZ)"
+
+          # SECOND OVERLAP GUARD. The concurrency group stops a second *runner* job, but another
+          # lane (hosted waker, a revived sentinel dispatch, Joseph's interactive session) may
+          # have woken the fleet while we slept. If any waker breadcrumb is newer than the moment
+          # we started waiting, that lane owns this window — do not run a second orchestrator
+          # against the same resume queue.
+          NEW_LWA=""
+          if curl -fsS --max-time 20 "$SENTINEL_URL" -o sentinel2.json 2>/dev/null; then
+            NEW_LWA=$(jq -r '.lastWakerActivity // empty' sentinel2.json)
+            echo "post-sleep sentinel: $(jq -c '{lastWakerActivity,live}' sentinel2.json)"
+          fi
+          NEW_E=$( [ -n "$NEW_LWA" ] && date -u -d "$NEW_LWA" +%s 2>/dev/null || echo 0 )
+          if [ "${NEW_E:-0}" -gt "${GATE_START_EPOCH:-0}" ]; then
+            echo "::warning title=overlap guard::another waker lane ran at $NEW_LWA (after our gate at $GATE_START_EPOCH) — standing down."
+            echo "abort=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no competing waker activity during the sleep — proceeding."
+            echo "abort=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run orchestrator (in-job reset detector + burst)
+        if: steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken' && steps.gate.outputs.gate != 'exit' && steps.sleeper.outputs.abort != 'true' && github.event.inputs.gate_dry_run != 'true'
         working-directory: l3rain
         env:
-          # gh CLICK and any git push target the PRIVATE l3rain repo, so use the PAT here,
+          # gh CLI and any git push target the PRIVATE l3rain repo, so use the PAT here,
           # not this runner repo's github.token (which has no access to l3rain).
           GH_TOKEN: ${{ secrets.L3RAIN_PAT }}
           WAKER_MODE: ${{ steps.guard.outputs.mode }}
           RUN_ID: ${{ github.run_id }}
+          GATE_REASON: ${{ steps.gate.outputs.reason }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set +e
+          echo "gate decision was: $GATE_REASON"
           RESUME_PROMPT='You are agent-cpd-orchestrator. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md, .l3rain/resume-queue.json, and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Relaunch each pending workstream where it stopped, in dependency order, per operating rule 3. Atomic tasks; at ~95% usage CHECKPOINT per rule 3 (commit + push + queue update) and stop cleanly. Staleness rule: if the queue contradicts git reality, trust git log + l3rain_operational_progress.md and repair the queue. Mark entries done as their work lands; mark blocked-needs-joseph and SKIP after a failed 3-round escalation.'
           REFILL_PROMPT='You are agent-cpd-orchestrator. The resume queue is empty. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md (section "Next"), and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Maximum-autonomy build mode: pull the next task(s) from l3rain_operational_progress.md "Next" in priority order (when dry, derive from the CLAUDE.md phase gates), decompose into atomic workstreams per rule 3, enqueue them in .l3rain/resume-queue.json (commit + push), then execute the first one. Same checkpoint, staleness, and blocked-needs-joseph rules. NEVER perform tier-3 irreversible actions (first prod deploy, real money, external comms, real tenants, legal/fiscal) — those need explicit instruction.'
           if [ "$WAKER_MODE" = "refill" ]; then PROMPT="$REFILL_PROMPT"; else PROMPT="$RESUME_PROMPT"; fi
@@ -154,7 +352,7 @@ jobs:
             exit 0
           fi
 
-          # --- usage-sentinel: it IS a usage limit ---
+          # --- IN-JOB DETECTOR: it IS a usage limit, and Claude's refusal carries the REAL reset ---
           mkdir -p .l3rain
           TARGET=$(bash scripts/waker-target-epoch.sh waker-run.log 2>/dev/null || true)
           NOW=$(date -u +%s)
@@ -167,11 +365,14 @@ jobs:
           echo "$(date -u +%FT%TZ) run=$RUN_ID mode=$WAKER_MODE limit_hit reset_at=$WHEN wait_s=$WAIT" >> .l3rain/reset-observations.log
           echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: usage limit; reset_at=$WHEN wait_s=$WAIT" >> progress.log
 
-          NEAR=${SENTINEL_NEAR_WINDOW:-1800}
+          # Sleep budget: the horizon, further clamped so the bursts still fit inside the job.
+          BUDGET=$(( ${JOB_DEADLINE_EPOCH:-0} - NOW - BURST_RESERVE_S ))
+          MAXS="$SLEEP_HORIZON_S"
+          [ "${JOB_DEADLINE_EPOCH:-0}" -gt 0 ] && [ "$BUDGET" -lt "$MAXS" ] && MAXS="$BUDGET"
           BURST=${SENTINEL_BURST_MAX:-10}
-          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -le "$NEAR" ]; then
-            echo "near reset (${WAIT}s) — sleeping then bursting up to ${BURST}x @1/min"
-            sleep "$WAIT"
+          if [ "$WAIT" -gt 0 ] && [ "$WAIT" -le "$MAXS" ]; then
+            echo "reset in ${WAIT}s (<= budget ${MAXS}s) — sleeping to it, then bursting up to ${BURST}x @1/min"
+            sleep "$(( WAIT + 60 ))"   # reset + 60s, same offset the sentinel used
             for i in $(seq 1 "$BURST"); do
               run_claude; EXIT=$?
               echo "burst $i/$BURST exit=$EXIT"
@@ -180,23 +381,23 @@ jobs:
               sleep 60
             done
           else
-            echo "far/unknown reset (${WAIT}s) — exiting; the hourly cron is the fallback floor for this bridge"
+            echo "reset ${WAIT}s out is unknown or beyond the ${MAXS}s budget — exiting; the hourly cron is the fallback floor for this bridge"
           fi
           exit 0
 
       - name: Update usage-reset ledger (auto-append)
-        if: always() && steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken'
+        if: always() && steps.guard.outputs.mode != 'stop' && steps.guard.outputs.mode != 'notoken' && github.event.inputs.gate_dry_run != 'true'
         working-directory: l3rain
         run: node scripts/usage-reset-ledger.mjs || true
 
       - name: Persist breadcrumbs and work products (push back to l3rain via PAT)
-        if: always() && steps.guard.outputs.mode != 'notoken'
+        if: always() && steps.guard.outputs.mode != 'notoken' && github.event.inputs.gate_dry_run != 'true'
         working-directory: l3rain
         run: |
           git config user.name "l3rain-agent[bot]"
           git config user.email "l3rain-agent@users.noreply.github.com"
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }} branch=$BRANCH mode=${{ steps.guard.outputs.mode || 'unknown' }} status=${{ job.status }}" >> progress.log
+          echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }} branch=$BRANCH mode=${{ steps.guard.outputs.mode || 'unknown' }} gate=${{ steps.gate.outputs.gate || 'n/a' }} status=${{ job.status }}" >> progress.log
           git add -A
           if git diff --cached --quiet; then echo "nothing to persist"; exit 0; fi
           if git diff --cached --name-only | grep -qE '^(apps|packages)/'; then
