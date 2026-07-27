@@ -69,6 +69,17 @@ on:
         description: "Override the max pre-flight sleep in seconds (default 14400 = 4h). 0 disables pre-flight sleeping."
         required: false
         default: ""
+      # TEST HOOKS — they only rewrite the gate's LOCAL copy of the sentinel reading so the
+      # sleep/exit branches can be exercised on demand instead of waiting hours for a real cap.
+      # They cannot be set by a schedule, only by someone with write access dispatching by hand.
+      simulate_pct:
+        description: "TEST ONLY: pretend the 5h window is N% used (e.g. 99 to force the capped branch)."
+        required: false
+        default: ""
+      simulate_reset_in_s:
+        description: "TEST ONLY: pretend the 5h reset is N seconds from now (e.g. 45 for a short, real sleep)."
+        required: false
+        default: ""
   # NEVER add pull_request — secret-exfiltration risk on a public repo.
 
 # OVERLAP GUARD. A job may now stay alive for hours while it sleeps to the reset, so the next
@@ -176,6 +187,8 @@ jobs:
         env:
           HORIZON_OVERRIDE: ${{ github.event.inputs.sleep_horizon_s }}
           GATE_DRY_RUN: ${{ github.event.inputs.gate_dry_run }}
+          SIM_PCT: ${{ github.event.inputs.simulate_pct }}
+          SIM_RESET_IN: ${{ github.event.inputs.simulate_reset_in_s }}
         run: |
           set -u
           NOW=$(date -u +%s)
@@ -213,6 +226,16 @@ jobs:
           echo "last waker activity anywhere: ${LWA:-none}"
           # Recorded so the post-sleep overlap guard can tell "someone else woke while we slept".
           echo "GATE_START_EPOCH=$NOW" >> "$GITHUB_ENV"
+
+          # --- TEST HOOKS: rewrite the local copy of the reading (manual dispatch only) ---
+          case "${SIM_RESET_IN:-}" in ''|*[!0-9]*) : ;; *)
+            LIVE_RESET=$(date -u -d "@$(( NOW + SIM_RESET_IN ))" +%FT%TZ); CAPTURED=$(date -u -d "@$NOW" +%FT%TZ)
+            echo "::warning title=simulated::pretending the 5h reset is $LIVE_RESET (${SIM_RESET_IN}s out)";;
+          esac
+          case "${SIM_PCT:-}" in ''|*[!0-9]*) : ;; *)
+            LIVE_PCT="$SIM_PCT"; CAPTURED=$(date -u -d "@$NOW" +%FT%TZ)
+            echo "::warning title=simulated::pretending the 5h window is ${SIM_PCT}% used";;
+          esac
 
           # --- is the live reading fresh enough to be authoritative? ---
           CAP_E=$(iso2epoch "$CAPTURED"); LIVE_OK=0
