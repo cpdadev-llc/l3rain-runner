@@ -201,7 +201,12 @@ jobs:
           case "${HORIZON_OVERRIDE:-}" in ''|*[!0-9]*) : ;; *) HORIZON="$HORIZON_OVERRIDE"; echo "horizon overridden to ${HORIZON}s";; esac
 
           iso2epoch () { [ -n "${1:-}" ] && date -u -d "$1" +%s 2>/dev/null || true; }
+          # reason/target embed values taken straight from the sentinel's JSON response
+          # (external input). Strip CR/LF so a crafted field cannot forge extra step outputs
+          # by injecting "\ngate=run" into $GITHUB_OUTPUT.
+          san () { printf '%s' "${1:-}" | tr -d '\r\n'; }
           emit () { # emit <gate> <sleep_s> <reason> [target_iso]
+            set -- "$(san "$1")" "$(san "$2")" "$(san "$3")" "$(san "${4:-}")"
             echo "gate=$1"      >> "$GITHUB_OUTPUT"
             echo "sleep_s=$2"   >> "$GITHUB_OUTPUT"
             echo "reason=$3"    >> "$GITHUB_OUTPUT"
@@ -292,8 +297,15 @@ jobs:
 
       - name: Gate dry-run — stop here
         if: github.event.inputs.gate_dry_run == 'true'
+        # Values reach these strings from the sentinel's JSON. Passing them through env
+        # instead of ${{ }} keeps them DATA — a ${{ }} expression is pasted into the shell
+        # script verbatim and would execute an injected $(...) / backtick.
+        env:
+          G_GATE: ${{ steps.gate.outputs.gate }}
+          G_SLEEP: ${{ steps.gate.outputs.sleep_s }}
+          G_REASON: ${{ steps.gate.outputs.reason }}
         run: |
-          echo "gate_dry_run=true → decision was '${{ steps.gate.outputs.gate }}' (sleep ${{ steps.gate.outputs.sleep_s }}s): ${{ steps.gate.outputs.reason }}"
+          echo "gate_dry_run=true → decision was '$G_GATE' (sleep ${G_SLEEP}s): $G_REASON"
           echo "Stopping before any sleep / Claude invocation."
 
       # Toolchain is installed BEFORE the sleep so that when the window rolls we start Claude
@@ -315,10 +327,16 @@ jobs:
       - name: Sleep to reset+60s
         id: sleeper
         if: steps.gate.outputs.gate == 'sleep' && github.event.inputs.gate_dry_run != 'true'
+        # Same rule as the dry-run step: sentinel-derived values arrive as env, never as
+        # ${{ }} inside the script body.
+        env:
+          G_SLEEP: ${{ steps.gate.outputs.sleep_s }}
+          G_TARGET: ${{ steps.gate.outputs.target }}
         run: |
           set -u
-          S="${{ steps.gate.outputs.sleep_s }}"
-          echo "sleeping ${S}s → target ${{ steps.gate.outputs.target }} +60s (now $(date -u +%FT%TZ))"
+          S="$G_SLEEP"
+          case "$S" in ''|*[!0-9]*) echo "::error::non-numeric sleep_s refused"; exit 1;; esac
+          echo "sleeping ${S}s → target ${G_TARGET} +60s (now $(date -u +%FT%TZ))"
           sleep "$S"
           echo "woke at $(date -u +%FT%TZ)"
 
