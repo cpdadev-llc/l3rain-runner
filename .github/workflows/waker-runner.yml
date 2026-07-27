@@ -23,6 +23,19 @@
 #         "near reset" window; it is now the full sleep horizon, because minutes are free.
 #   Net effect: whatever tick we land on, the fleet resumes at reset+~60s, not up to 4h late.
 #
+# PRECISION / HONESTY CORRECTIONS (2026-07-27, independent review of the mechanism above)
+#   * The pre-flight sleep converges on an ABSOLUTE wake epoch published by the gate, not on
+#     the duration the gate measured. The toolchain install sits between the two, so a
+#     duration-based sleep silently added the install time to the target (measured reset+68s
+#     warm, worse on a cold runner). See "Sleep to reset+60s".
+#   * A tick that does NO WORK (usage gate said `exit`, STOP file, overlap stand-down) no
+#     longer writes a `waker(<src>)` breadcrumb. That line is the fleet's ACTIVITY SIGNAL —
+#     the sentinel dedups on it — so writing it on an idle tick forged "the fleet just ran".
+#     See "Persist breadcrumbs and work products".
+#   * A missing/garbled usage percentage is UNKNOWN, never 0%. Zero reads as "maximum
+#     headroom", which is the dangerous direction: it hid a possible weekly cap and would
+#     authorise a multi-hour sleep on no evidence. See "THE USAGE GATE".
+#
 # WHY WE DO NOT PRE-EMPTIVELY SLEEP ON THE BREADCRUMB ALONE
 #   `breadcrumbReset` records when the CURRENT window opened (open + 5h). A breadcrumb reset in
 #   the future does NOT mean we are capped — the window may still have plenty of headroom, and
@@ -396,14 +409,19 @@ jobs:
           # (external input). Strip CR/LF so a crafted field cannot forge extra step outputs
           # by injecting "\ngate=run" into $GITHUB_OUTPUT.
           san () { printf '%s' "${1:-}" | tr -d '\r\n'; }
-          emit () { # emit <gate> <sleep_s> <reason> [target_iso]
-            set -- "$(san "$1")" "$(san "$2")" "$(san "$3")" "$(san "${4:-}")"
-            echo "gate=$1"      >> "$GITHUB_OUTPUT"
-            echo "sleep_s=$2"   >> "$GITHUB_OUTPUT"
-            echo "reason=$3"    >> "$GITHUB_OUTPUT"
-            echo "target=${4:-}" >> "$GITHUB_OUTPUT"
+          # `wake_epoch` is the ABSOLUTE instant the sleeper must converge on (unix seconds).
+          # `sleep_s` is only the duration as measured HERE — informational, and the fallback
+          # if wake_epoch is ever missing. See the sleeper step for why the absolute form is
+          # the load-bearing one.
+          emit () { # emit <gate> <sleep_s> <reason> [target_iso] [wake_epoch]
+            set -- "$(san "$1")" "$(san "$2")" "$(san "$3")" "$(san "${4:-}")" "$(san "${5:-}")"
+            echo "gate=$1"        >> "$GITHUB_OUTPUT"
+            echo "sleep_s=$2"     >> "$GITHUB_OUTPUT"
+            echo "reason=$3"      >> "$GITHUB_OUTPUT"
+            echo "target=$4"      >> "$GITHUB_OUTPUT"
+            echo "wake_epoch=$5"  >> "$GITHUB_OUTPUT"
             echo "::notice title=usage gate::$1 (sleep=${2}s) — $3 ${4:+[reset $4]}"
-            echo "DECISION: gate=$1 sleep=${2}s reason=$3 target=${4:-none}"
+            echo "DECISION: gate=$1 sleep=${2}s reason=$3 target=${4:-none} wake_epoch=${5:-none}"
           }
 
           # --- read the sentinel (never fatal) ---
@@ -452,18 +470,40 @@ jobs:
             emit run 0 "no-fresh-live-reading (breadcrumbReset=${BREAD:-none}) — run now; in-job detector will sleep to the real reset if we are actually capped"; exit 0
           fi
 
+          # Integer part only ("96.4" → "96"); every comparison below is a shell integer test.
           FIVE=${LIVE_PCT%%.*}; WEEK=${WEEK_PCT%%.*}
-          case "$FIVE" in ''|*[!0-9]*) FIVE=0;; esac
-          case "$WEEK" in ''|*[!0-9]*) WEEK=0;; esac
+          # A MISSING or garbled percentage is UNKNOWN — it is NOT 0. Defaulting to 0 read as
+          # "0% used = maximum headroom", which is the dangerous direction in BOTH places the
+          # value is used: it silently hides a weekly cap, and it silently hides a maxed 5h
+          # window. Carry the unknown explicitly instead and let each branch decide.
+          case "$FIVE" in ''|*[!0-9]*) FIVE=unknown;; esac
+          case "$WEEK" in ''|*[!0-9]*) WEEK=unknown;; esac
+          echo "parsed usage: 5h=${FIVE} weekly=${WEEK}  (unknown = field absent or unparseable)"
 
-          if [ "$WEEK" -ge "$WINDOW_FULL_PCT" ]; then
+          if [ "$WEEK" != "unknown" ] && [ "$WEEK" -ge "$WINDOW_FULL_PCT" ]; then
             # A 5h reset does not clear a WEEKLY cap — sleeping to it would burn hours for a run
             # that still cannot work. Leave it to a later tick.
             emit exit 0 "weekly cap at ${WEEK}% (>=${WINDOW_FULL_PCT}%) — a 5h reset will not clear it"; exit 0
           fi
 
+          if [ "$FIVE" = "unknown" ]; then
+            # Fresh capture, unreadable 5h figure ⇒ no PROOF we are capped, so the same rule as
+            # a stale reading applies: run now, and let the in-job detector supply the precision.
+            emit run 0 "fresh capture but 5h usedPct is absent/garbled — usage UNKNOWN (not 0%), running now; the in-job detector will sleep to the real reset if we are actually capped"; exit 0
+          fi
+
           if [ "$FIVE" -lt "$WINDOW_FULL_PCT" ]; then
             emit run 0 "live-window-open: 5h at ${FIVE}% (<${WINDOW_FULL_PCT}%) — headroom, run now" "$LIVE_RESET"; exit 0
+          fi
+
+          if [ "$WEEK" = "unknown" ]; then
+            # 5h is maxed, and committing to a MULTI-HOUR sleep is only justified if the weekly
+            # cap is known to be clear — a 5h reset does not clear a weekly one. Do not guess in
+            # either direction: a fabricated 0% would authorise the sleep, and `exit` would hand
+            # the fleet back to a cron GitHub throttles to 1-4h. Run instead: when we really are
+            # capped the call is cheap, and Claude's own refusal carries the AUTHORITATIVE reset
+            # (weekly or 5h) that the in-job detector then sleeps to.
+            emit run 0 "5h maxed (${FIVE}%) but weeklyUsedPct is UNKNOWN — refusing to commit to a long 5h sleep on a guess; running so the in-job detector can read the real reset from the refusal" "$LIVE_RESET"; exit 0
           fi
 
           # --- capped: pick the reset instant (live preferred, breadcrumb as fallback) ---
@@ -484,7 +524,9 @@ jobs:
           if [ "$WAIT" -gt "$MAXS" ]; then
             emit exit 0 "5h maxed (${FIVE}%) but ${SRC} reset ${TARGET_ISO} is ${WAIT}s out (> horizon ${MAXS}s) — a later cron tick will take the wait"; exit 0
           fi
-          emit sleep "$WAIT" "5h maxed (${FIVE}%) — sleeping ${WAIT}s to ${SRC} reset+60s" "$TARGET_ISO"
+          # Hand the sleeper the ABSOLUTE instant ($WAKE), not just the duration: the toolchain
+          # install between this step and the sleep would otherwise be added on top of $WAIT.
+          emit sleep "$WAIT" "5h maxed (${FIVE}%) — sleeping to ${SRC} reset+60s (${WAIT}s from this gate)" "$TARGET_ISO" "$WAKE"
 
       - name: Gate dry-run — stop here
         if: github.event.inputs.gate_dry_run == 'true'
@@ -515,6 +557,19 @@ jobs:
 
       # THE SLEEP. Free on a public repo; this is what buys reset+60s precision despite the
       # cron being throttled to ~1-4h. Clamped by the horizon AND the job deadline upstream.
+      #
+      # SLEEP TO AN ABSOLUTE EPOCH, NOT A PRE-COMPUTED DURATION (independent-review nit N2).
+      #   The gate runs, THEN setup-node + `npm i -g @anthropic-ai/claude-code` run, THEN this
+      #   step sleeps. Sleeping the gate's duration therefore lands at reset+60s PLUS whatever
+      #   the install cost — measured reset+68s on a warm runner and ~reset+80-110s on a cold
+      #   one. The gate now publishes the absolute wake instant (reset+60s as unix seconds) and
+      #   this step converges on THAT, so nothing that happens before or during the wait can
+      #   eat the precision. (The toolchain still installs BEFORE the sleep on purpose — see
+      #   the ordering note above; the point of an absolute target is that its cost is absorbed
+      #   by the wait rather than added to it.)
+      #   The wait is re-evaluated against the clock in bounded chunks instead of one long
+      #   `sleep`, so a short/interrupted sleep or a clock step is corrected rather than
+      #   inherited, and the final chunk lands exactly on the target.
       - name: Sleep to reset+60s
         id: sleeper
         if: steps.gate.outputs.gate == 'sleep' && github.event.inputs.gate_dry_run != 'true'
@@ -523,13 +578,46 @@ jobs:
         env:
           G_SLEEP: ${{ steps.gate.outputs.sleep_s }}
           G_TARGET: ${{ steps.gate.outputs.target }}
+          G_WAKE_EPOCH: ${{ steps.gate.outputs.wake_epoch }}
+          RECHECK_MAX_S: "300" # longest single sleep before re-reading the clock
         run: |
           set -u
           S="$G_SLEEP"
           case "$S" in ''|*[!0-9]*) echo "::error::non-numeric sleep_s refused"; exit 1;; esac
-          echo "sleeping ${S}s → target ${G_TARGET} +60s (now $(date -u +%FT%TZ))"
-          sleep "$S"
-          echo "woke at $(date -u +%FT%TZ)"
+
+          # Absolute target from the gate; fall back to "now + the gate's duration" if it is
+          # ever absent (older gate, garbled output) so this step can never become the reason
+          # the fleet stops sleeping.
+          WAKE="$G_WAKE_EPOCH"
+          case "$WAKE" in
+            ''|*[!0-9]*)
+              WAKE=$(( $(date -u +%s) + S ))
+              echo "::warning title=sleeper::gate published no absolute wake epoch — falling back to the relative ${S}s duration (precision may drift)"
+              ;;
+          esac
+
+          # The gate already clamped its own WAIT to the horizon and the job budget, but the
+          # absolute value is re-clamped here too: this step must never sleep past the point
+          # where the orchestrator would no longer fit inside the job. Written as a plain `if`
+          # on purpose — Actions runs step bodies under `bash -e`, where a bare
+          # `[ … ] && VAR=…` whose test is FALSE returns 1 and silently kills the script.
+          if [ "${JOB_DEADLINE_EPOCH:-0}" -gt 0 ]; then
+            LATEST=$(( JOB_DEADLINE_EPOCH - PREFLIGHT_RESERVE_S ))
+            if [ "$WAKE" -gt "$LATEST" ]; then
+              echo "::warning title=sleeper::wake epoch is past the job budget — clamping (reserve ${PREFLIGHT_RESERVE_S}s for the orchestrator)"
+              WAKE="$LATEST"
+            fi
+          fi
+
+          echo "now $(date -u +%FT%TZ) → sleeping until $(date -u -d "@$WAKE" +%FT%TZ) (target ${G_TARGET} +60s; gate measured ${S}s)"
+          while :; do
+            NOW=$(date -u +%s)
+            REMAIN=$(( WAKE - NOW ))
+            if [ "$REMAIN" -le 0 ]; then break; fi
+            if [ "$REMAIN" -gt "$RECHECK_MAX_S" ]; then REMAIN="$RECHECK_MAX_S"; fi
+            sleep "$REMAIN"
+          done
+          echo "woke at $(date -u +%FT%TZ) — $(( $(date -u +%s) - WAKE ))s off the absolute target"
 
           # SECOND OVERLAP GUARD. The concurrency group stops a second *runner* job, but another
           # lane (hosted waker, a revived sentinel dispatch, an operator's interactive session) may
@@ -650,6 +738,12 @@ jobs:
       - name: Persist breadcrumbs and work products (push back to l3rain via PAT)
         if: always() && steps.guard.outputs.mode != 'notoken' && github.event.inputs.gate_dry_run != 'true'
         working-directory: l3rain
+        env:
+          W_MODE: ${{ steps.guard.outputs.mode || 'unknown' }}
+          W_GATE: ${{ steps.gate.outputs.gate || 'n/a' }}
+          W_ABORT: ${{ steps.sleeper.outputs.abort || 'false' }}
+          W_STATUS: ${{ job.status }}
+          W_RUN_ID: ${{ github.run_id }}
         run: |
           # PUBLIC LOG DISCIPLINE: every git command here is silenced into a runner-local
           # file. `git commit` prints "create mode ... <path>" for every new file and
@@ -660,7 +754,27 @@ jobs:
           git config user.name "l3rain-agent[bot]"
           git config user.email "l3rain-agent@users.noreply.github.com"
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }} branch=$BRANCH mode=${{ steps.guard.outputs.mode || 'unknown' }} gate=${{ steps.gate.outputs.gate || 'n/a' }} status=${{ job.status }}" >> progress.log
+
+          # A `waker(<src>)` line in progress.log is not a log line — it is the fleet's
+          # ACTIVITY SIGNAL. The Cloudflare sentinel reads the newest one as
+          # `lastWakerActivity` and feeds it into its dedup backstop, and the status-lights
+          # writer reads it as "the fleet is alive". Writing one on a tick that did NO WORK
+          # forges that signal: the sentinel then believes a lane just ran and holds off its
+          # own dispatch, and the dashboard shows activity that never happened.
+          # So: only ticks that could actually have done work leave a breadcrumb. Everything
+          # else still runs the rest of this step, so any real file change (e.g. the ledger)
+          # is still committed and pushed — we suppress the false SIGNAL, not the work.
+          NO_WORK=""
+          case "$W_GATE" in
+            exit) NO_WORK="gate=exit — the usage gate declined this tick";;
+          esac
+          if [ "$W_MODE" = "stop" ]; then NO_WORK="mode=stop — the STOP file halted the fleet"; fi
+          if [ "$W_ABORT" = "true" ]; then NO_WORK="overlap stand-down — another waker lane owns this window"; fi
+          if [ -n "$NO_WORK" ]; then
+            echo "no-work tick ($NO_WORK) — NOT writing a waker breadcrumb (it would forge lastWakerActivity)"
+          else
+            echo "$(date -u +%FT%TZ) waker(runner) $W_RUN_ID branch=$BRANCH mode=$W_MODE gate=$W_GATE status=$W_STATUS" >> progress.log
+          fi
 
           # The orchestrator transcript replaces the old PUBLIC artifact: on a failed run it is
           # stashed inside the PRIVATE repo (force-added — *.log is git-ignored there).
