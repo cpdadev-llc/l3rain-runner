@@ -38,8 +38,22 @@
 #     workflow_dispatch + schedule (both run trusted, first-party code only).
 #   - Secrets (L3RAIN_PAT, CLAUDE_CODE_OAUTH_TOKEN) are auto-masked by Actions and are never
 #     echoed; the PAT is embedded in the clone/push remote URL, which bash does not print.
-#   - permissions: contents: read — this workflow needs no write access to THIS repo.
+#   - permissions: contents: read + actions: write. The write scope exists for ONE purpose:
+#     letting the job delete THIS repo's own completed workflow runs after archiving their
+#     logs privately (see SELF-CLEANING below). Do not widen it further.
 #   - The sentinel URL is public read-only JSON (no auth, no secrets in the request).
+#   - This file must never contain the orchestrator's real prompts: anything written here is
+#     readable by anyone AND is echoed into every run log. The prompts live in the PRIVATE
+#     repo and are read from the runtime clone (see "Run orchestrator" below).
+#
+# SELF-CLEANING (2026-07-27)
+#   Public-repo Actions logs never expire, so every run would otherwise leave a permanent,
+#   world-readable record. The job therefore starts by archiving EVERY prior completed run's
+#   log zip into the PRIVATE repo and then deleting that run from this public repo. Order is
+#   archive-then-delete, always: a run is only deleted once its archive is confirmed present
+#   on the private remote. The step is fail-soft — log hygiene must never block the fleet.
+#   Residual exposure: a run cannot delete itself, so the most recent completed run stays
+#   visible until the next tick collects it.
 #
 # RETIREMENT / DECOMMISSION TRIGGER
 #   Retire the sleep mechanism (and this whole repo) when BOTH hold:
@@ -91,13 +105,18 @@ on:
 #     only the newest pending run per group, so the backlog can never exceed 1 and the fleet
 #     picks straight back up when the sleeper finishes.
 # A second, independent guard lives in the post-sleep re-check step below: it aborts if ANOTHER
-# lane (hosted waker, sentinel dispatch, Joseph's interactive session) woke while we slept.
+# lane (hosted waker, sentinel dispatch, an operator's interactive session) woke while we slept.
 concurrency:
   group: l3rain-waker-runner
   cancel-in-progress: false
 
+# contents: read  — the workflow never writes to THIS repo's git tree.
+# actions:  write — the ONLY reason for a write scope: DELETE this repo's own completed
+#                   workflow runs once their logs are archived in the private repo. The
+#                   repo's own GITHUB_TOKEN can do that; no PAT and no wider scope needed.
 permissions:
   contents: read
+  actions: write
 
 jobs:
   wake:
@@ -142,6 +161,168 @@ jobs:
           # PUBLIC LOG: never print the private repo's SHA or branch name — branch names
           # leak roadmap/feature intent. Existence of the clone is already public (README).
           echo "cloned private l3rain into ./l3rain (revision withheld — public log)"
+
+      # ── SELF-CLEANING: archive prior run logs privately, then purge them from public view ──
+      # Public-repo logs never expire. Every completed run of this workflow is therefore
+      # collected here: its log zip is downloaded, committed into the PRIVATE repo, pushed,
+      # and ONLY THEN is the run deleted from this public repo.
+      #
+      # INVARIANTS
+      #   * archive-then-delete, never the reverse — a run is deleted only after its archive is
+      #     confirmed to exist on the private REMOTE (`git cat-file -e origin/<branch>:<path>`),
+      #     not merely in the local working copy. A failed push ⇒ zero deletes this tick.
+      #   * idempotent — an id whose archive already exists is never re-downloaded; it is still
+      #     re-considered for deletion, which is exactly how a previously-failed delete retries.
+      #   * fail-soft — `continue-on-error` + a bare `exit 0`: log hygiene must NEVER block the
+      #     orchestrator, which is the entire point of this fleet.
+      #   * runs BEFORE the guards, so it also collects on STOP / no-token / gate-exit / dry-run
+      #     ticks. Self-cleaning must not depend on the fleet actually doing work.
+      #   * the current run cannot delete itself (GitHub rejects deleting a non-completed run),
+      #     so the newest completed run always waits for the next tick. That is the floor.
+      # RACE: the workflow-level concurrency group means two runs of THIS workflow never execute
+      # at once, so two ticks cannot archive the same id concurrently. The only real contention
+      # is another lane pushing to the private repo at the same instant — handled by the
+      # rebase-and-retry below, and if it still fails the deletes are skipped (safe direction).
+      - name: Archive prior run logs to the private repo, then delete them from public view
+        id: purge
+        continue-on-error: true
+        working-directory: l3rain
+        env:
+          # THIS repo's own token (actions: write) — not the PAT. It can only touch this
+          # public repo's runs; it has no access to the private l3rain.
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          ARCHIVE_MAX: "40" # per-tick cap so a backlog can never eat the job's time budget
+        run: |
+          set -u
+          TMP="${RUNNER_TEMP:-/tmp}"          # scratch MUST stay outside the private clone,
+          DEST=".l3rain/waker-logs"           # or the Persist step would commit it
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          mkdir -p "$DEST"
+
+          # Rename-proof: github.workflow_ref is "<owner>/<repo>/.github/workflows/<file>@<ref>".
+          WF="${GITHUB_WORKFLOW_REF##*/workflows/}"; WF="${WF%%@*}"
+          [ -n "$WF" ] || WF="waker-runner.yml"
+
+          # 1. Completed runs of THIS workflow, excluding the one executing right now.
+          #    (The current run is in_progress so it would not match anyway — the explicit
+          #    exclusion is belt-and-braces, and it is passed via env, never interpolated.)
+          if ! gh api -H "Accept: application/vnd.github+json" \
+                 "repos/$GITHUB_REPOSITORY/actions/workflows/$WF/runs?status=completed&per_page=100" \
+                 --jq '.workflow_runs[] | select((.id|tostring) != env.CURRENT_RUN_ID) | .id' \
+                 > "$TMP/prior-runs.txt" 2>"$TMP/list-err.txt"; then
+            echo "::warning title=log purge::could not list prior runs — skipping this tick (fleet unaffected)"
+            exit 0
+          fi
+          # `grep -c` exits 1 on zero matches, so capture then normalise — `|| echo 0` would
+          # concatenate grep's own "0" with the fallback and yield a non-numeric TOTAL.
+          TOTAL=$(grep -c . "$TMP/prior-runs.txt" 2>/dev/null) || true
+          case "${TOTAL:-}" in ''|*[!0-9]*) TOTAL=0;; esac
+          echo "prior completed runs of $WF awaiting collection: $TOTAL"
+          [ "$TOTAL" -gt 0 ] || { echo "nothing to archive or purge"; exit 0; }
+
+          # 2. Download each run's log zip into the private clone (skip anything already there).
+          NEWLY=""   # ids fetched this tick — deletable only after a successful push
+          PRESENT="" # ids whose archive came with the clone ⇒ already on the private remote
+          n=0
+          while read -r ID; do
+            case "$ID" in ''|*[!0-9]*) continue;; esac
+            n=$((n+1))
+            if [ "$n" -gt "$ARCHIVE_MAX" ]; then
+              echo "hit ARCHIVE_MAX=$ARCHIVE_MAX this tick — the remainder is collected next tick"
+              break
+            fi
+            ZIP="$DEST/run-$ID-logs.zip"
+            MARK="$DEST/run-$ID-logs.missing.txt"
+            if [ -f "$ZIP" ] || [ -f "$MARK" ]; then
+              echo "run $ID: already archived — no re-download"
+              PRESENT="$PRESENT $ID"
+              continue
+            fi
+            # The logs endpoint answers 302 to a storage URL. Resolve the redirect first and
+            # fetch it WITHOUT the auth header (the storage host rejects a second credential).
+            API="https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$ID/logs"
+            rm -f "$TMP/dl.zip"; DL_OK=0
+            URL=$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 30 \
+                    -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                    "$API" 2>/dev/null || true)
+            if [ -n "$URL" ] && curl -sS -L --max-time 180 -o "$TMP/dl.zip" "$URL" 2>/dev/null && [ -s "$TMP/dl.zip" ]; then
+              DL_OK=1
+            else
+              # Fallback for a 200-with-body response. curl drops the Authorization header on a
+              # cross-host redirect by default, so attaching it here is safe in both shapes.
+              rm -f "$TMP/dl.zip"
+              curl -sS -L --max-time 180 -o "$TMP/dl.zip" \
+                   -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                   "$API" 2>/dev/null || true
+              [ -s "$TMP/dl.zip" ] && DL_OK=1
+            fi
+            # A JSON error body ("Not Found") is not an archive. Require the zip magic before
+            # believing we hold the logs — otherwise we would delete a run we never archived.
+            if [ "$DL_OK" = "1" ] && [ "$(head -c 2 "$TMP/dl.zip" 2>/dev/null)" != "PK" ]; then
+              DL_OK=0; rm -f "$TMP/dl.zip"
+            fi
+            if [ "$DL_OK" = "1" ]; then
+              mv "$TMP/dl.zip" "$ZIP"
+              echo "run $ID: logs archived privately ($(wc -c < "$ZIP" | tr -d ' ') bytes)"
+            else
+              # No downloadable logs (expired/absent). Nothing to leak, but keep the
+              # archive-then-delete invariant honest by recording WHY there is no zip.
+              printf 'run_id=%s\ncollected_at=%s\nnote=Actions API returned no downloadable log archive for this run (expired or absent); the run itself was purged from the public repo.\n' \
+                "$ID" "$(date -u +%FT%TZ)" > "$MARK"
+              echo "run $ID: no downloadable logs — marker recorded instead"
+            fi
+            NEWLY="$NEWLY $ID"
+          done < "$TMP/prior-runs.txt"
+
+          # 3. Commit + push the archives BEFORE any delete. All git output is silenced: it
+          #    enumerates private paths and prints the private branch name.
+          PUSH_OK=0
+          if [ -n "$NEWLY" ]; then
+            git config user.name "l3rain-agent[bot]"
+            git config user.email "l3rain-agent@users.noreply.github.com"
+            git add -f "$DEST" >/dev/null 2>&1 || true
+            if git diff --cached --quiet; then
+              PUSH_OK=1
+            else
+              git commit -q -m "chore(waker): archive public run logs [skip ci]" >/dev/null 2>&1 || true
+              if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+                git pull --rebase -q origin "$BRANCH" >/dev/null 2>&1 || true
+              fi
+              if git push -q origin "HEAD:$BRANCH" >/dev/null 2>&1; then
+                PUSH_OK=1
+              else
+                git pull --rebase -q origin "$BRANCH" >/dev/null 2>&1 || true
+                git push -q origin "HEAD:$BRANCH" >/dev/null 2>&1 && PUSH_OK=1
+              fi
+            fi
+            if [ "$PUSH_OK" = "1" ]; then
+              echo "archive push: ok"
+            else
+              echo "::warning title=log purge::archive push FAILED — every delete is skipped this tick; nothing is lost and the next tick retries"
+            fi
+          fi
+
+          # 4. Delete ONLY what is provably archived on the private remote.
+          CAND="$PRESENT"
+          [ "$PUSH_OK" = "1" ] && CAND="$CAND $NEWLY"
+          DELETED=0; FAILED=0; SKIPPED=0
+          for ID in $CAND; do
+            if git cat-file -e "origin/$BRANCH:$DEST/run-$ID-logs.zip" 2>/dev/null \
+               || git cat-file -e "origin/$BRANCH:$DEST/run-$ID-logs.missing.txt" 2>/dev/null; then
+              if gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$ID" >/dev/null 2>&1; then
+                DELETED=$((DELETED+1)); echo "run $ID: archived → deleted from public view"
+              else
+                FAILED=$((FAILED+1))
+                echo "::warning title=log purge::run $ID is archived but its DELETE failed — next tick retries it"
+              fi
+            else
+              SKIPPED=$((SKIPPED+1))
+              echo "run $ID: archive not confirmed on the private remote — delete skipped (archive-before-delete)"
+            fi
+          done
+          echo "purge summary: archived_now=$(printf '%s' "$NEWLY" | wc -w | tr -d ' ') deleted=$DELETED delete_failed=$FAILED skipped=$SKIPPED"
+          exit 0
 
       - name: Guards (pure shell, 0 tokens)
         id: guard
@@ -341,7 +522,7 @@ jobs:
           echo "woke at $(date -u +%FT%TZ)"
 
           # SECOND OVERLAP GUARD. The concurrency group stops a second *runner* job, but another
-          # lane (hosted waker, a revived sentinel dispatch, Joseph's interactive session) may
+          # lane (hosted waker, a revived sentinel dispatch, an operator's interactive session) may
           # have woken the fleet while we slept. If any waker breadcrumb is newer than the moment
           # we started waiting, that lane owns this window — do not run a second orchestrator
           # against the same resume queue.
@@ -373,14 +554,29 @@ jobs:
         run: |
           set +e
           echo "gate decision was: $GATE_REASON"
-          RESUME_PROMPT='You are agent-cpd-orchestrator. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md, .l3rain/resume-queue.json, and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Relaunch each pending workstream where it stopped, in dependency order, per operating rule 3. Atomic tasks; at ~95% usage CHECKPOINT per rule 3 (commit + push + queue update) and stop cleanly. Staleness rule: if the queue contradicts git reality, trust git log + l3rain_operational_progress.md and repair the queue. Mark entries done as their work lands; mark blocked-needs-joseph and SKIP after a failed 3-round escalation.'
-          REFILL_PROMPT='You are agent-cpd-orchestrator. The resume queue is empty. Read CLAUDE.md, AGENTS.md, l3rain_operational_progress.md (section "Next"), and .l3rain/l3rain_operational_orchestrator_resume_prompt.md. Maximum-autonomy build mode: pull the next task(s) from l3rain_operational_progress.md "Next" in priority order (when dry, derive from the CLAUDE.md phase gates), decompose into atomic workstreams per rule 3, enqueue them in .l3rain/resume-queue.json (commit + push), then execute the first one. Same checkpoint, staleness, and blocked-needs-joseph rules. NEVER perform tier-3 irreversible actions (first prod deploy, real money, external comms, real tenants, legal/fiscal) — those need explicit instruction.'
-          if [ "$WAKER_MODE" = "refill" ]; then PROMPT="$REFILL_PROMPT"; else PROMPT="$RESUME_PROMPT"; fi
+
+          # PROMPTS LIVE IN THE PRIVATE REPO — do not re-inline them here.
+          # The real resume/refill prompts name the private repo's internal state files and
+          # restate its escalation/guardrail doctrine. Written in THIS file they would be
+          # readable by anyone browsing the public repo AND echoed into every public run log.
+          # They are therefore read at runtime out of the private clone made above; only a
+          # deliberately generic fallback (no filenames, no doctrine) lives here, so the fleet
+          # still runs if the private file is ever missing. The prompt text is NEVER echoed.
+          PROMPT_DIR=".l3rain/waker-prompts"
+          if [ "$WAKER_MODE" = "refill" ]; then PROMPT_FILE="$PROMPT_DIR/refill.txt"; else PROMPT_FILE="$PROMPT_DIR/resume.txt"; fi
+          FALLBACK_PROMPT='You are agent-cpd-orchestrator for this repository. Read its operating docs (CLAUDE.md, AGENTS.md) and follow the operating rules they define. Resume any pending work exactly where it stopped, in dependency order; if nothing is pending, take the next task from the documented plan. Keep tasks atomic, checkpoint and stop cleanly when approaching the usage ceiling, and never take irreversible real-world actions without explicit instruction.'
+          if [ -s "$PROMPT_FILE" ]; then
+            PROMPT=$(cat "$PROMPT_FILE")
+            echo "prompt: loaded from the private repo ($(wc -c < "$PROMPT_FILE" | tr -d ' ') bytes — content withheld, public log)"
+          else
+            PROMPT="$FALLBACK_PROMPT"
+            echo "::warning title=prompt::private prompt file for mode '$WAKER_MODE' is absent — running on the generic public fallback"
+          fi
 
           LIMIT_RE='usage limit|session limit|rate limit|weekly limit|hit your [a-z ]*limit|too many requests|429|resets? (at|in) |try again (at|in) |quota'
           run_claude () { claude -p "$PROMPT" --dangerously-skip-permissions --model claude-opus-4-8 > waker-run.log 2>&1; }
 
-          # Joseph's computed reset chain: the first run_claude below OPENS this 5h window,
+          # The computed reset chain: the first run_claude below OPENS this 5h window,
           # so its reset = now + 5h. Record it to progress.log NOW (the Persist step pushes
           # it → the sentinel re-arms for reset+60s) — no cap hit needed, no-op if another
           # session already opened this window. scripts/window-reset-tracker.mjs.
