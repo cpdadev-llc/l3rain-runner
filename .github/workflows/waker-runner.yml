@@ -139,7 +139,9 @@ jobs:
           # Token is embedded in the remote URL for auth; Actions masks it in all logs and
           # bash does not echo the expanded command. The ./l3rain dir is git-ignored here.
           git clone --depth 1 "https://x-access-token:${L3RAIN_PAT}@github.com/cpdadev-llc/l3rain.git" l3rain
-          echo "cloned l3rain @ $(git -C l3rain rev-parse --short HEAD) on $(git -C l3rain rev-parse --abbrev-ref HEAD)"
+          # PUBLIC LOG: never print the private repo's SHA or branch name — branch names
+          # leak roadmap/feature intent. Existence of the clone is already public (README).
+          echo "cloned private l3rain into ./l3rain (revision withheld — public log)"
 
       - name: Guards (pure shell, 0 tokens)
         id: guard
@@ -367,11 +369,16 @@ jobs:
           node scripts/window-reset-tracker.mjs || true
 
           run_claude; EXIT=$?
-          echo "claude exit: $EXIT"; tail -n 12 waker-run.log
+          # PUBLIC LOG: waker-run.log is the orchestrator's full transcript over the PRIVATE
+          # repo (source, diffs, roadmap, unshipped security work). NEVER print its contents.
+          # Safe summary only: exit code + size. The log itself is stashed into the private
+          # repo by the Persist step when the run failed (see WAKER_LOG_KEEP below).
+          echo "claude exit: $EXIT (transcript withheld — private; $(wc -l < waker-run.log 2>/dev/null || echo 0) lines, $(wc -c < waker-run.log 2>/dev/null || echo 0) bytes)"
           if [ "$EXIT" -eq 0 ]; then echo "success"; exit 0; fi
 
           if ! grep -qiE "$LIMIT_RE" waker-run.log; then
-            echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: exit $EXIT NON-LIMIT — see artifact" >> progress.log
+            echo "$(date -u +%FT%TZ) waker(runner) $RUN_ID: exit $EXIT NON-LIMIT — see .l3rain/waker-logs/run-$RUN_ID.log" >> progress.log
+            echo "WAKER_LOG_KEEP=1" >> "$GITHUB_ENV"   # stash the transcript in the PRIVATE repo
             exit 0
           fi
 
@@ -406,6 +413,9 @@ jobs:
           else
             echo "reset ${WAIT}s out is unknown or beyond the ${MAXS}s budget — exiting; the hourly cron is the fallback floor for this bridge"
           fi
+          # Still failing after the bursts ⇒ preserve the transcript in the PRIVATE repo
+          # (never as a public artifact) so the next tick can diagnose it.
+          [ "${EXIT:-1}" -ne 0 ] && echo "WAKER_LOG_KEEP=1" >> "$GITHUB_ENV"
           exit 0
 
       - name: Update usage-reset ledger (auto-append)
@@ -417,10 +427,26 @@ jobs:
         if: always() && steps.guard.outputs.mode != 'notoken' && github.event.inputs.gate_dry_run != 'true'
         working-directory: l3rain
         run: |
+          # PUBLIC LOG DISCIPLINE: every git command here is silenced into a runner-local
+          # file. `git commit` prints "create mode ... <path>" for every new file and
+          # `git pull --rebase` prints a diffstat — both enumerate PRIVATE repo paths into a
+          # world-readable log. We print pass/fail only; details stay on the runner and die
+          # with it. Commit SHAs and the branch name are likewise withheld.
+          GITLOG="${RUNNER_TEMP:-/tmp}/git-persist.log"
           git config user.name "l3rain-agent[bot]"
           git config user.email "l3rain-agent@users.noreply.github.com"
           BRANCH=$(git rev-parse --abbrev-ref HEAD)
           echo "$(date -u +%FT%TZ) waker(runner) ${{ github.run_id }} branch=$BRANCH mode=${{ steps.guard.outputs.mode || 'unknown' }} gate=${{ steps.gate.outputs.gate || 'n/a' }} status=${{ job.status }}" >> progress.log
+
+          # The orchestrator transcript replaces the old PUBLIC artifact: on a failed run it is
+          # stashed inside the PRIVATE repo (force-added — *.log is git-ignored there).
+          if [ "${WAKER_LOG_KEEP:-0}" = "1" ] && [ -s waker-run.log ]; then
+            mkdir -p .l3rain/waker-logs
+            cp waker-run.log ".l3rain/waker-logs/run-${{ github.run_id }}.log"
+            git add -f ".l3rain/waker-logs/run-${{ github.run_id }}.log" >>"$GITLOG" 2>&1 || true
+            echo "persist: failed-run transcript stashed privately"
+          fi
+
           git add -A
           if git diff --cached --quiet; then echo "nothing to persist"; exit 0; fi
           if git diff --cached --name-only | grep -qE '^(apps|packages)/'; then
@@ -428,18 +454,28 @@ jobs:
           else
             MSG="agent: waker(runner) run ${{ github.run_id }} breadcrumbs [skip ci]"
           fi
-          git commit -m "$MSG"
+          # -q: suppress the create-mode/diffstat file listing (private paths).
+          git commit -q -m "$MSG" >>"$GITLOG" 2>&1
           # origin already carries the PAT from the clone URL, so push authenticates cleanly.
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            git pull --rebase origin "$BRANCH" || true
+            git pull --rebase -q origin "$BRANCH" >>"$GITLOG" 2>&1 || true
           fi
-          git push -u origin "HEAD:$BRANCH" || (git pull --rebase origin "$BRANCH" && git push -u origin "HEAD:$BRANCH")
+          if git push -q -u origin "HEAD:$BRANCH" >>"$GITLOG" 2>&1; then
+            echo "persist: committed and pushed ok"
+          else
+            git pull --rebase -q origin "$BRANCH" >>"$GITLOG" 2>&1 || true
+            if git push -q -u origin "HEAD:$BRANCH" >>"$GITLOG" 2>&1; then
+              echo "persist: committed and pushed ok (after rebase)"
+            else
+              # Fail the step exactly like the original did, without printing git's output.
+              echo "::error::persist: push to the private repo FAILED (details withheld from this public log; they are in the runner-local $GITLOG)"
+              exit 1
+            fi
+          fi
 
-      - name: Upload run log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: waker-runner-run-${{ github.run_id }}
-          path: l3rain/waker-run.log
-          retention-days: 7
-          if-no-files-found: ignore
+      # REMOVED (2026-07-27, security): "Upload run log" published l3rain/waker-run.log — the
+      # orchestrator's full transcript over the PRIVATE repo — as a world-downloadable artifact
+      # on this PUBLIC repo for 7 days. Actions masks registered secrets; it does NOT mask
+      # private source, diffs, roadmap, or unshipped security work. Failed-run transcripts now
+      # go to the PRIVATE repo (.l3rain/waker-logs/) via the Persist step above.
+      # Do not re-add an artifact upload to this workflow while the repo is public.
